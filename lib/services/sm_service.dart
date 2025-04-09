@@ -10,7 +10,7 @@ class SmsServiceInitializer {
     await smsParserService.requestSmsPermission();
 
     // Initialize background service for SMS listening
-    await smsParserService.initSmsListenerService();
+    // await smsParserService.initSmsListenerService();
 
     debugPrint('SMS service initialized successfully');
   }

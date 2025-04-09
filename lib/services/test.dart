@@ -1,70 +1,31 @@
 // import 'package:flutter/foundation.dart';
-// import 'package:flutter_sms_inbox/flutter_sms_inbox.dart' as sms_inbox;
-// import 'package:telephony/telephony.dart' as telephony;
+// import 'package:flutter_sms_inbox/flutter_sms_inbox.dart';
 // import 'package:intl/intl.dart';
 // import 'package:permission_handler/permission_handler.dart';
+// import 'package:flutter_background_service/flutter_background_service.dart';
+// import 'package:flutter_background_service_android/flutter_background_service_android.dart';
+// import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 // import '../models/transaction.dart';
 // import '../database/transaction_database.dart';
+// import 'package:telephony/telephony.dart' as tele_phonye;
 //
 // class SmsParserService {
-//   final sms_inbox.SmsQuery _query = sms_inbox.SmsQuery();
-//   List<sms_inbox.SmsMessage> _messages = [];
-//   // Telephony instance for listening to SMS
-//   final telephony.Telephony telephonyInstance = telephony.Telephony.instance;
-//
-//   // Constructor to initialize SMS listener
-//   SmsParserService() {
-//     initSmsListener();
-//   }
-//
-//   // Initialize SMS listener
-//   Future<void> initSmsListener() async {
-//     final bool? result = await telephonyInstance.requestPhoneAndSmsPermissions;
-//
-//     if (result != null && result) {
-//       telephonyInstance.listenIncomingSms(
-//         onNewMessage: onSmsReceived,
-//         onBackgroundMessage: onBackgroundSmsReceived,
-//       );
-//       debugPrint('SMS listener initialized successfully');
-//     } else {
-//       debugPrint('Failed to get SMS permission for listener');
-//     }
-//   }
-//
-//   // Handle SMS received in foreground
-//   void onSmsReceived(telephony.SmsMessage message) async {
-//     debugPrint('New SMS received: ${message.body}');
-//     // Convert telephony.SmsMessage to equivalent format for processing
-//     final convertedMessage = sms_inbox.SmsMessage.fromJson({
-//       'address': message.address,
-//       'body': message.body,
-//       'date': message.date != null ? message.date.toString() : DateTime.now().millisecondsSinceEpoch.toString(),
-//       'read': message.read ?? false,
-//       '_id': message.id ?? '0',
-//       'sender': message.address,
-//     });
-//     // Process the message
-//     await processNewMessage(convertedMessage);
-//   }
-//
-//   // Process newly received message
-//   Future<void> processNewMessage(sms_inbox.SmsMessage message) async {
-//     final transaction = parseMessageToTransaction(message);
-//     if (transaction != null) {
-//       await TransactionDatabase.instance.create(transaction);
-//       debugPrint('New transaction added: ${transaction.title} - ${transaction.amount}');
-//     }
-//   }
+//   final SmsQuery _query = SmsQuery();
+//   List<SmsMessage> _messages = [];
+//   final tele_phonye.Telephony telephony = tele_phonye.Telephony.instance;
 //
 //   // Request SMS permission
 //   Future<bool> requestSmsPermission() async {
 //     final status = await Permission.sms.request();
+//
+//     // Also request notification permission for background service
+//     await Permission.notification.request();
+//
 //     return status.isGranted;
 //   }
 //
 //   // Fetch all SMS messages
-//   Future<List<sms_inbox.SmsMessage>> getAllSms() async {
+//   Future<List<SmsMessage>> getAllSms() async {
 //     final permission = await requestSmsPermission();
 //     if (!permission) {
 //       return [];
@@ -74,7 +35,7 @@
 //     return _messages;
 //   }
 //
-//   // Parse SMS for transactions
+//   // Parse SMS for transactions from today
 //   Future<List<Transactions>> parseTransactionsFromSms() async {
 //     try {
 //       List<Transactions> parsedTransactions = [];
@@ -106,8 +67,110 @@
 //     }
 //   }
 //
+//   // Initialize the background service to listen for SMS
+//   Future<void> initSmsListenerService() async {
+//     final service = FlutterBackgroundService();
+//
+//     const AndroidNotificationChannel channel = AndroidNotificationChannel(
+//       'sms_parser_channel', // id
+//       'SMS Transaction Parser', // title
+//       description: 'Listens for financial SMS messages', // description
+//       importance: Importance.high,
+//     );
+//
+//     final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+//     FlutterLocalNotificationsPlugin();
+//
+//     await flutterLocalNotificationsPlugin
+//         .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+//         ?.createNotificationChannel(channel);
+//
+//     await service.configure(
+//       androidConfiguration: AndroidConfiguration(
+//         onStart: onStart,
+//         autoStart: true,
+//         isForegroundMode: true,
+//         notificationChannelId: 'sms_parser_channel',
+//         initialNotificationTitle: 'SMS Transaction Parser',
+//         initialNotificationContent: 'Running in background',
+//         foregroundServiceNotificationId: 888,
+//       ),
+//       iosConfiguration: IosConfiguration(
+//         autoStart: true,
+//         onForeground: onStart,
+//         onBackground: onIosBackground,
+//       ),
+//     );
+//
+//     // Register SMS listener using telephony package
+//     await registerSmsListener();
+//   }
+//
+//   // Register SMS listener using the telephony package
+//   Future<void> registerSmsListener() async {
+//     final bool? result = await telephony.requestPhoneAndSmsPermissions;
+//
+//     if (result != null && result) {
+//       telephony.listenIncomingSms(
+//         onNewMessage: (tele_phonye.SmsMessage message) {
+//           _processIncomingSms(message);
+//         },
+//         onBackgroundMessage: backgroundMessageHandler,
+//       );
+//       debugPrint('SMS listener registered successfully');
+//     } else {
+//       debugPrint('SMS permission denied');
+//     }
+//   }
+//
+//   // Process incoming SMS messages
+//   void _processIncomingSms(tele_phonye.SmsMessage message) async {
+//     // We need to process the telephony SmsMessage directly
+//     // Rather than trying to convert it to flutter_sms_inbox.SmsMessage
+//     final transaction = _parseTelephonySmsToTransaction(message);
+//     if (transaction != null) {
+//       await TransactionDatabase.instance.create(transaction);
+//       debugPrint('Transaction added from incoming SMS: ${transaction.title}');
+//     }
+//   }
+//
+//   // Parse telephony SmsMessage to transaction
+//   Transactions? _parseTelephonySmsToTransaction(tele_phonye.SmsMessage message) {
+//     final String body = message.body ?? '';
+//     final String sender = message.address ?? '';
+//
+//     // Check if the message is from a bank or payment service
+//     if (!isFinancialMessage(sender, body)) {
+//       return null;
+//     }
+//
+//     // Parse amount
+//     final double? amount = extractAmount(body);
+//     if (amount == null) {
+//       return null;
+//     }
+//
+//     // Determine if it's an expense or income
+//     final bool isExpense = determineTransactionType(body);
+//
+//     // Extract title/description
+//     final String title = extractDescription(body, sender);
+//
+//     // Determine category
+//     final String category = determineCategory(body, title);
+//
+//     return Transactions(
+//       title: title,
+//       amount: amount,
+//       date: DateTime.now(), // Use current time as telephony message doesn't have date
+//       category: category,
+//       isExpense: isExpense,
+//       source: 'auto',
+//     );
+//   }
+//
 //   // Logic to parse message to transaction
-//   Transactions? parseMessageToTransaction(sms_inbox.SmsMessage message) {
+//   Transactions? parseMessageToTransaction(SmsMessage message) {
 //     final String body = message.body ?? '';
 //     final String sender = message.sender ?? '';
 //
@@ -272,14 +335,38 @@
 //   }
 // }
 //
-// // Background message handler - must be a top-level function
+// // Background handler for SMS messages (outside the class)
 // @pragma('vm:entry-point')
-// void onBackgroundSmsReceived(telephony.SmsMessage message) async {
-//   // Note: This can't directly use class methods as it's a top-level function
-//   // You may need to implement simplified processing here or use a background service pattern
-//   debugPrint('SMS received in background: ${message.body}');
+// void backgroundMessageHandler(tele_phonye.SmsMessage message) async {
+//   // Create a instance just for processing this message
+//   final smsParser = SmsParserService();
 //
-//   // For simple cases, you could re-implement basic parsing logic here
-//   // Or use a method channel to communicate with your service
-//   // This depends on your app architecture
+//   // Process the message directly with a new method that handles telephony.SmsMessage
+//   final transaction = smsParser._parseTelephonySmsToTransaction(message);
+//   if (transaction != null) {
+//     await TransactionDatabase.instance.create(transaction);
+//   }
+// }
+//
+// // Background service main function
+// @pragma('vm:entry-point')
+// void onStart(ServiceInstance service) async {
+//   // This function will be called when the service is started
+//
+//   if (service is AndroidServiceInstance) {
+//     service.setAsForegroundService();
+//   }
+//
+//   service.on('stopService').listen((event) {
+//     service.stopSelf();
+//   });
+//
+//   // Keep the service alive
+//   debugPrint('Background service started');
+// }
+//
+// // iOS background processing
+// @pragma('vm:entry-point')
+// Future<bool> onIosBackground(ServiceInstance service) async {
+//   return true;
 // }

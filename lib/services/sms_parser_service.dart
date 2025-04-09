@@ -1,64 +1,123 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_sms_inbox/flutter_sms_inbox.dart';
-import 'package:intl/intl.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter_background_service/flutter_background_service.dart';
-import 'package:flutter_background_service_android/flutter_background_service_android.dart';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/transaction.dart';
 import '../database/transaction_database.dart';
-import 'package:telephony/telephony.dart' as tele_phonye;
 
 class SmsParserService {
   final SmsQuery _query = SmsQuery();
   List<SmsMessage> _messages = [];
-  final tele_phonye.Telephony telephony = tele_phonye.Telephony.instance;
+  final String _lastOpenTimeKey = 'last_app_open_time';
+  final String _isFirstOpenKey = 'is_first_app_open';
 
   // Request SMS permission
   Future<bool> requestSmsPermission() async {
     final status = await Permission.sms.request();
-
-    // Also request notification permission for background service
-    await Permission.notification.request();
-
     return status.isGranted;
   }
 
-  // Fetch all SMS messages
-  Future<List<SmsMessage>> getAllSms() async {
+  // Save current timestamp as last opened time
+  Future<void> saveOpenTime() async {
+    final prefs = await SharedPreferences.getInstance();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    await prefs.setInt(_lastOpenTimeKey, now);
+    await prefs.setBool(_isFirstOpenKey, false);
+  }
+
+  // Check if this is first app open
+  Future<bool> isFirstOpen() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_isFirstOpenKey) ?? true;
+  }
+
+  // Get last app open time
+  Future<DateTime?> getLastOpenTime() async {
+    final prefs = await SharedPreferences.getInstance();
+    final timestamp = prefs.getInt(_lastOpenTimeKey);
+    if (timestamp == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(timestamp);
+  }
+
+  // Fetch SMS messages based on app open status
+  Future<List<SmsMessage>> getRelevantSms() async {
     final permission = await requestSmsPermission();
     if (!permission) {
       return [];
     }
 
+    // Get all SMS messages
     _messages = await _query.getAllSms;
-    return _messages;
+
+    // Check if this is first app open
+    final firstOpen = await isFirstOpen();
+
+    if (firstOpen) {
+      // First time open: Get last 7 transactions
+      debugPrint('First app open - fetching last 7 financial messages');
+      return getLastNFinancialMessages(7);
+    } else {
+      // Subsequent open: Get messages since last open
+      final lastOpenTime = await getLastOpenTime();
+      if (lastOpenTime == null) {
+        // Fallback if somehow we have no lastOpenTime but it's not first open
+        return getLastNFinancialMessages(7);
+      }
+
+      debugPrint('Fetching messages since last open: ${lastOpenTime.toString()}');
+      return getMessagesSinceTime(lastOpenTime);
+    }
   }
 
-  // Parse SMS for transactions from today
+  // Get the last N financial messages
+  List<SmsMessage> getLastNFinancialMessages(int count) {
+    // Filter financial messages
+    final financialMessages = _messages.where((message) =>
+        isFinancialMessage(message.sender ?? '', message.body ?? '')
+    ).toList();
+
+    // Sort by date (newest first)
+    financialMessages.sort((a, b) =>
+        (b.date ?? DateTime.now()).compareTo(a.date ?? DateTime.now())
+    );
+
+    // Return the last N messages (or all if less than N)
+    return financialMessages.take(count).toList();
+  }
+
+  // Get messages since a specific time
+  List<SmsMessage> getMessagesSinceTime(DateTime sinceTime) {
+    return _messages.where((message) =>
+    message.date != null &&
+        message.date!.isAfter(sinceTime) &&
+        isFinancialMessage(message.sender ?? '', message.body ?? '')
+    ).toList();
+  }
+
+  // Parse SMS for transactions
   Future<List<Transactions>> parseTransactionsFromSms() async {
     try {
       List<Transactions> parsedTransactions = [];
-      final messages = await getAllSms();
+      final messages = await getRelevantSms();
 
-      // Get today's date to compare
-      DateTime today = DateTime.now();
-      String formattedDate = DateFormat('yyyy-MM-dd').format(today); // Format as 'YYYY-MM-DD'
+      // Get existing transactions to check for duplicates
+      final existingTransactions = await TransactionDatabase.instance.readAllTransactions();
 
       for (var message in messages) {
-        // Check if the message is from today
-        DateTime messageDate = message.date ?? DateTime.now();
-        String messageDateString = DateFormat('yyyy-MM-dd').format(messageDate);
-
-        // Only parse if the message is from today
-        if (messageDateString == formattedDate) {
-          final transaction = parseMessageToTransaction(message);
-          if (transaction != null) {
+        final transaction = parseMessageToTransaction(message);
+        if (transaction != null) {
+          // Check if this transaction already exists in the database
+          if (!isDuplicate(transaction, existingTransactions)) {
             parsedTransactions.add(transaction);
             await TransactionDatabase.instance.create(transaction);
+          } else {
+            debugPrint('Skipping duplicate transaction: ${transaction.title} - ${transaction.amount}');
           }
         }
       }
+
+      // Save current time as last open time
+      await saveOpenTime();
 
       return parsedTransactions;
     } catch (e) {
@@ -67,105 +126,19 @@ class SmsParserService {
     }
   }
 
-  // Initialize the background service to listen for SMS
-  Future<void> initSmsListenerService() async {
-    final service = FlutterBackgroundService();
-
-    const AndroidNotificationChannel channel = AndroidNotificationChannel(
-      'sms_parser_channel', // id
-      'SMS Transaction Parser', // title
-      description: 'Listens for financial SMS messages', // description
-      importance: Importance.high,
-    );
-
-    final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
-    FlutterLocalNotificationsPlugin();
-
-    await flutterLocalNotificationsPlugin
-        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(channel);
-
-    await service.configure(
-      androidConfiguration: AndroidConfiguration(
-        onStart: onStart,
-        autoStart: true,
-        isForegroundMode: true,
-        notificationChannelId: 'sms_parser_channel',
-        initialNotificationTitle: 'SMS Transaction Parser',
-        initialNotificationContent: 'Running in background',
-        foregroundServiceNotificationId: 888,
-      ),
-      iosConfiguration: IosConfiguration(
-        autoStart: true,
-        onForeground: onStart,
-        onBackground: onIosBackground,
-      ),
-    );
-
-    // Register SMS listener using telephony package
-    await registerSmsListener();
-  }
-
-  // Register SMS listener using the telephony package
-  Future<void> registerSmsListener() async {
-    final bool? result = await telephony.requestPhoneAndSmsPermissions;
-
-    if (result != null && result) {
-      telephony.listenIncomingSms(
-        onNewMessage: (tele_phonye.SmsMessage message) {
-          _processIncomingSms(message);
-        },
-        onBackgroundMessage: backgroundMessageHandler,
-      );
-      debugPrint('SMS listener registered successfully');
-    } else {
-      debugPrint('SMS permission denied');
-    }
-  }
-
-  // Process incoming SMS messages
-  void _processIncomingSms(tele_phonye.SmsMessage message) async {
-    // We need to process the telephony SmsMessage directly
-    // Rather than trying to convert it to flutter_sms_inbox.SmsMessage
-    final transaction = _parseTelephonySmsToTransaction(message);
-    if (transaction != null) {
-      await TransactionDatabase.instance.create(transaction);
-      debugPrint('Transaction added from incoming SMS: ${transaction.title}');
-    }
-  }
-
-  // Parse telephony SmsMessage to transaction
-  Transactions? _parseTelephonySmsToTransaction(tele_phonye.SmsMessage message) {
-    final String body = message.body ?? '';
-    final String sender = message.address ?? '';
-
-    // Check if the message is from a bank or payment service
-    if (!isFinancialMessage(sender, body)) {
-      return null;
-    }
-
-    // Parse amount
-    final double? amount = extractAmount(body);
-    if (amount == null) {
-      return null;
-    }
-
-    // Determine if it's an expense or income
-    final bool isExpense = determineTransactionType(body);
-
-    // Extract title/description
-    final String title = extractDescription(body, sender);
-
-    // Determine category
-    final String category = determineCategory(body, title);
-
-    return Transactions(
-      title: title,
-      amount: amount,
-      date: DateTime.now(), // Use current time as telephony message doesn't have date
-      category: category,
-      isExpense: isExpense,
-      source: 'auto',
+  // Check if a transaction is a duplicate
+  bool isDuplicate(Transactions newTransaction, List<Transactions> existingTransactions) {
+    return existingTransactions.any((existing) =>
+    // Check if same amount
+    existing.amount == newTransaction.amount &&
+        // Check if same date (comparing only year, month, day)
+        existing.date.year == newTransaction.date.year &&
+        existing.date.month == newTransaction.date.month &&
+        existing.date.day == newTransaction.date.day &&
+        // Check if same title
+        existing.title == newTransaction.title &&
+        // Check if same transaction type (expense/income)
+        existing.isExpense == newTransaction.isExpense
     );
   }
 
@@ -333,40 +306,4 @@ class SmsParserService {
     // Default category
     return 'Others';
   }
-}
-
-// Background handler for SMS messages (outside the class)
-@pragma('vm:entry-point')
-void backgroundMessageHandler(tele_phonye.SmsMessage message) async {
-  // Create a instance just for processing this message
-  final smsParser = SmsParserService();
-
-  // Process the message directly with a new method that handles telephony.SmsMessage
-  final transaction = smsParser._parseTelephonySmsToTransaction(message);
-  if (transaction != null) {
-    await TransactionDatabase.instance.create(transaction);
-  }
-}
-
-// Background service main function
-@pragma('vm:entry-point')
-void onStart(ServiceInstance service) async {
-  // This function will be called when the service is started
-
-  if (service is AndroidServiceInstance) {
-    service.setAsForegroundService();
-  }
-
-  service.on('stopService').listen((event) {
-    service.stopSelf();
-  });
-
-  // Keep the service alive
-  debugPrint('Background service started');
-}
-
-// iOS background processing
-@pragma('vm:entry-point')
-Future<bool> onIosBackground(ServiceInstance service) async {
-  return true;
 }
